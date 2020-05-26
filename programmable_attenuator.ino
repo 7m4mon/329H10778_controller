@@ -1,10 +1,11 @@
-
 /*
 AnritsuのMG3633Aから取り外したステップアッテネーター
 329H10778 を制御するプログラム
 WAVGATのチップはATMEGA328ではないのでドライバを指定しないと4MHzで動くらしい！
 
-2020/05/03 7M4MON
+author: 7M4MON
+2020/05/03 初版
+2020/05/26 プリセットボタン処理の実装
 */
 
 #define MAX_ATT 145 	// 60 + 20 + 20 + 20 + 10 + 8 + 4 + 2 + 1
@@ -18,6 +19,7 @@ TM1637Display display(CLK, DIO);
 
 #define PCF8574A_ADDR 0x38
 #include <Wire.h>
+#include <EEPROM.h>
 
 #define PIN_ENC_A 2      // interrupt pin
 #define PIN_ENC_B 3      // rotary encoder 
@@ -34,10 +36,6 @@ TM1637Display display(CLK, DIO);
 #define PIN_SER_TX 1
 #define PIN_SER_RX 0
 
-#define ATT_PRES1 0
-#define ATT_PRES2 60
-#define ATT_PRES3 MAX_ATT
-
 #define SERIAL_CONTROL_ENABLE
 
 void change_attenuator(){
@@ -45,8 +43,8 @@ void change_attenuator(){
 	bool s;
 
 	att_val = ( att_val > MAX_ATT ) ? MAX_ATT : att_val;		// 範囲制限
-
-	if (att_val == last_att_val ) return;		//変化なしの場合、なにもしない。
+    
+	if (att_val == last_att_val ) return;		//変化なしの場合、ATTは動かさない。
 
 	v = att_val;
 	b = 0;
@@ -74,12 +72,11 @@ void change_attenuator(){
 	Wire.beginTransmission(PCF8574A_ADDR);
   	Wire.write(b);
   	Wire.endTransmission();
-
-	//表示を上書き
-	display.showNumberDec(att_val * -1);
-	#ifdef SERIAL_CONTROL_ENABLE
-	Serial.write(att_val);				//シリアルで結果を通知
-	#endif
+   
+    //表示を上書き
+    display.showNumberDec(att_val * -1);
+    //シリアルで値を通知
+    Serial.write(att_val); 
  	last_att_val = att_val;
 }
 
@@ -116,8 +113,8 @@ void setup(){
 	Serial.begin(9600); 
 	display.setBrightness(0x0f);
 	last_att_val = 255;
-	att_val = MAX_ATT;		//ToDo: eepromからロード
-	effect_rt = false;		//ToDo: eepromからロード
+	att_val = MAX_ATT;
+	effect_rt = false;
 	digitalWrite(PIN_LED_IMM, effect_rt);
     attachInterrupt(1, read_rotary_enc, CHANGE);   //1:Pin3 A エッジ両取り込み
 	change_attenuator();
@@ -132,6 +129,7 @@ void loop(){
 		}else{
      		att_val = cmd;
 			change_attenuator();		//effect_rt がfalseでもSerialの場合は即実行する。
+            display.showNumberDec(att_val * -1);    //表示を更新
 		 }		
     }
 	#endif
@@ -159,18 +157,45 @@ void loop(){
 		}
 	}
 
-	// プリセットボタン処理 押されたら即反映する。
-	// ToDo: プリセットボタン長押しで上書き
-	if (digitalRead(PIN_PRES1) == LOW) {
-		att_val = ATT_PRES1;
-		change_attenuator();
-	} else if (digitalRead(PIN_PRES2) == LOW) {
-		att_val = ATT_PRES2;
-		change_attenuator();
-	} else if (digitalRead(PIN_PRES3) == LOW) {
-		att_val = ATT_PRES3;
-		change_attenuator();
-	} 
+	// プリセットボタン処理 離されたら反映する。
+	// プリセットボタン長押しで上書き
+	if (digitalRead(PIN_PRES1) == LOW ||
+	    digitalRead(PIN_PRES2) == LOW ||
+        digitalRead(PIN_PRES3) == LOW
+	    ) {
+        delay(10);  //チャタリングの防止
+        uint8_t pres_num, i;
+        // 要因の調査
+        pres_num = digitalRead(PIN_PRES1) == LOW  ? 1 :
+                   digitalRead(PIN_PRES2) == LOW  ? 2 :
+                   digitalRead(PIN_PRES3) == LOW  ? 3 : 0;
+        hold_time = 0;
+        while ( digitalRead(PIN_PRES1) == LOW ||
+                digitalRead(PIN_PRES2) == LOW ||
+                digitalRead(PIN_PRES3) == LOW
+        ){
+            delay(1);
+            hold_time++;
+            if (hold_time == HOLD_TIME_MS){         //長押しでEEPROMに保存
+                EEPROM.write(pres_num, att_val);
+                for (i = 0; i < 5 ; i++){           //LED点滅でフィードバック
+                    digitalWrite(PIN_LED_DIFF, LOW);
+                    delay(100);
+                    digitalWrite(PIN_LED_DIFF, HIGH);
+                    delay(100);
+                }
+            } else if(hold_time > HOLD_TIME_MS){
+                hold_time = HOLD_TIME_MS + 1;   // オーバーフローの防止（65.535秒押し続けた場合に発生する）
+            }
+        }
+        //ボタンが離された
+        if (pres_num != 0){
+            att_val = EEPROM.read(pres_num);
+            change_attenuator();                 // 範囲制限もこちらで行う
+            display.showNumberDec(att_val * -1); // 表示の更新
+        }
+        delay(10);  //チャタリングの防止
+	}
 
 	//差分がある場合はLEDで警告
 	bool diff_alert = (last_att_val == att_val) ? false : true;
